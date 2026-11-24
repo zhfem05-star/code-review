@@ -1,0 +1,11 @@
+run_date=2026-11-23
+
+# 1) 초기화 + 테스트 데이터
+psql -U postgres -d dw -f seed.sql
+
+# 2) 배치 실행
+psql -U postgres -d dw -v run_date=2026-11-23 -f query.sql
+
+# 3) 결과 확인
+psql -U postgres -d dw -c "SELECT * FROM dw.fact_orders ORDER BY order_id;"
+psql -U postgres -d dw -c "SELECT * FROM dw.daily_revenue;"
