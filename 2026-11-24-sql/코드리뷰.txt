@@ -1,22 +1,88 @@
 # 코드 리뷰 — 2026-11-24 / SQL (PostgreSQL) / 미션 A
+# 결과: 재도전 (치명 미발견) · 6/10 (이해 2 / 발견·설명 2 / 코멘트·비판 2)
 
 ## 1. 3줄 요약
-- 입력: (무엇을 받나)
-- 처리: (어떤 방식으로 — 순차/병렬, 핵심 로직)
-- 출력: (무엇을 내놓나)
+- 입력: staging.raw_orders에서 run_date에 적재된 주문 이벤트 + dw.fx_rates 환율
+- 처리: latest CTE로 주문별 1건만 남기고 → converted CTE에서 원화 환산 → fact_orders에 upsert
+       (updated_at이 더 최신일 때만 갱신)
+- 출력: fact_orders(주문별 최신 상태)를 run_date 기준으로 집계해 daily_revenue(일별 요약)에 적재
 
 ## 2. 리뷰 코멘트
+# 표시: [직접 발견] / [부분 발견] / [정답 공개]
 
-### C1. [L00] 🔴/🟠/🟡 제목 한 줄
-- 왜 문제인가:
-- 언제 터지나:
-- 대안:
-- 재현(선택):
+### C1. [L43-46] 🔴 재실행하면 daily_revenue가 누적돼 2배, 3배가 됩니다   [정답 공개]
+- 왜: ON CONFLICT에서 기존 값 + EXCLUDED 값을 더하는데, EXCLUDED는 오늘 증분이 아니라
+  fact_orders의 그날 '전체'를 다시 집계한 값이다. 실행할 때마다 하루치 전체가 한 번씩 더 더해진다.
+  → 멱등성(idempotency)이 없다.
+- 언제: Airflow 재시도(최대 3회), 백필, 수동 재실행. 에러 없이 대시보드 매출이 부풀려진다.
+- 대안: 덮어쓰기로 변경
+  SET order_count = EXCLUDED.order_count,
+      revenue_krw = EXCLUDED.revenue_krw,
+      refund_rate = EXCLUDED.refund_rate
+- 재현: query.sql 2회 실행 → order_count 9 → 18, revenue_krw 106,160 → 212,320
 
-### C2. [L00] ...
+### C2. [L7, L11] 🟠 DISTINCT ON이 주문별 '최초' 이벤트를 남겨서 최신 상태가 반영되지 않습니다   [직접 발견 · 재도전]
+- 왜: DISTINCT ON은 ORDER BY 기준 첫 행을 남기는데, L11이 event_ts 오름차순이라
+  가장 오래된 이벤트가 선택된다. CTE 이름(latest)의 의도와 반대다.
+- 언제: 같은 날 상태가 여러 번 바뀐 주문
+  · paid → refunded: paid로 남아서 환불 누락, 매출 과대 집계
+  · created → paid: created로 남아서 L38 FILTER에서 빠짐, 매출 과소 집계
+- 대안: ORDER BY order_id, event_ts DESC
+  (같은 event_ts가 있을 수 있으면 정렬 키를 하나 더 두어 결과를 결정적으로 만들기)
+  ※ DISTINCT ON (order_id, event_ts)는 안 됨 → 같은 order_id가 여러 행 남아서
+    "ON CONFLICT DO UPDATE command cannot affect row a second time" 에러로 배치 실패
+- 재현: seed 후 실행 → fact_orders에서 101 = 'created', 103 = 'paid'
+
+### C3. [L10] 🟠 DATE(loaded_at) 조건 때문에 idx_raw_orders_loaded_at을 못 탑니다   [직접 발견]
+- 왜: 인덱스는 loaded_at 원본 값 순서로 저장돼 있어서, 함수를 씌운 값으로는 범위 탐색을
+  못 하고 Seq Scan이 된다. timestamptz→date는 immutable이 아니라 표현식 인덱스도 못 만든다.
+- 언제: staging이 90일치(약 1.8억 행) 쌓인 상태에서 매일 전체를 읽게 된다.
+- 대안: 반열린 구간으로 바꾸면 인덱스를 탄다.
+  WHERE loaded_at >= :'run_date'::date AND loaded_at < :'run_date'::date + 1
+  (세션 TimeZone을 Asia/Seoul로 고정하는 것도 같이)
+- 재현: gen_data.py 실행 후 EXPLAIN → Seq Scan / 위 조건으로 바꾸면 Bitmap Index Scan
+
+### C4. [L17, L21-23] 🟠 환율이 없는 주문은 amount_krw가 NULL이 되고, 매출에서 조용히 빠집니다   [부분 발견]
+- 왜: LEFT JOIN이라 짝이 없어도 행은 남지만 krw_rate가 NULL이고, amount * NULL = NULL이다.
+  L38 SUM은 NULL을 무시해서 에러 없이 매출이 작게 나온다.
+- 언제: ① KRW 주문(fx_rates에 KRW 행이 없음) ② 주말·공휴일 주문(환율 미고시일)
+- 대안: KRW는 CASE로 환율 1 처리, 나머지는 LATERAL 조인으로 rate_date <= event_ts::date 중
+  가장 최근 환율 사용. 적재 후 amount_krw IS NULL 건수를 검증하는 쿼리도 추가
+- 재현: seed 후 실행 → 102·106·110(KRW), 105(일요일 USD)의 amount_krw가 NULL
+- 메모: 처음에는 run_date와 환율 날짜의 불일치를 원인으로 봤는데, run_date는 조인 조건이 아니다.
+  조인 조건은 currency + event_ts::date(L22-23)이다.
+
+### C5. [L39] 🟠 정수 나눗셈이라 환불률이 항상 0입니다   [정답 공개]
+- 왜: COUNT(*)는 bigint라서 정수끼리 나누면 소수점 아래가 버려진다. 2 / 9 = 0.
+  컬럼이 NUMERIC(5,4)여도 계산이 저장 전에 끝나서 0이 들어간다.
+- 언제: 환불률 100%일 때를 빼면 항상 0
+- 대안: COUNT(*) FILTER (WHERE status = 'refunded')::numeric / NULLIF(COUNT(*), 0)
+- 재현: seed 후 실행 → refund_rate = 0.0000
+
+### C6. [전체] 🟡 두 문장이 트랜잭션으로 묶여 있지 않습니다   [정답 공개]
+- 왜: psql 기본은 autocommit이라 1단계만 커밋되고 2단계가 실패할 수 있다.
+- 언제: 2단계 실패 시 fact_orders와 daily_revenue가 서로 맞지 않는다. C1과 겹치면
+  부분 실패 → 재시도 → 누적으로 이어진다.
+- 대안: BEGIN; ... COMMIT;으로 감싸기 (ON_ERROR_STOP이 켜져 있어 에러 시 COMMIT 전에 중단 → 롤백)
+
+### 보너스 (심어 두지 않았지만 타당한 지적)
+- [L18, L23] event_ts::date는 세션 타임존 의존 → 서버가 UTC면 KST 00~09시 주문이 전날로 잡힘
+- [L41] 늦게 도착한 환불(22일 주문의 환불이 23일에 적재)은 fact_orders만 갱신되고,
+  22일 daily_revenue는 다시 집계되지 않음
+- [L37-38] 매출은 paid만, 주문 수는 전체 → 지표 정의 불일치
 
 ## 3. 좋은 점
-- [L00] 무엇이 왜 좋은가
+- [L32] WHERE updated_at < EXCLUDED.updated_at: 늦게 들어온 오래된 이벤트가 최신 상태를 덮어쓰지 못하게 막음
+- [L10, L41] psql 변수 :'run_date': 날짜 하드코딩 없음, 따옴표 처리를 psql이 해서 안전
+- [L6-24] CTE로 추출 → 변환 → 적재를 나눠서 읽는 순서와 처리 순서가 같음
 
-## 4. 질문 (확신 없는 것, 모르는 문법)
-- [L00]
+## 4. 질문 & 배운 점
+- Q. DATE(t) = d 대신 반열린 구간을 쓰는 이유? 집합으로는 동치 아닌가?
+  A. 동치가 맞다(세션 타임존이 같을 때). 차이는 인덱스를 탈 수 있느냐뿐이다.
+     loaded_at = '11-23'은 '그 순간'만 고르니까, 원본 컬럼을 유지하면서 '하루'를 표현하려면 범위가 필요하다.
+     그 범위 중 DATE() =와 같은 집합이 반열린 구간 [d, d+1)이다.
+     (BETWEEN ... 23:59:59는 소수점 초가 빠지고, BETWEEN d AND d+1은 자정 행이 이틀에 중복된다)
+- NULL은 산술에서는 퍼지고(x * NULL = NULL), 집계에서는 사라진다(SUM·AVG가 무시).
+  → LEFT JOIN을 보면 "짝 없는 행은 어디로 가지?"를 먼저 묻기
+- DISTINCT ON은 어떤 행을 남길지를 ORDER BY가 정한다
+- 다음에 신경 쓸 점: PR에 "재시도/백필/매일 실행"이 보이면 적재 쿼리를 두 번 돌린다고 상상하기
