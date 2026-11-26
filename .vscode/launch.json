@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "BackoffDemo",
+            "request": "launch",
+            "mainClass": "org.apache.kafka.common.utils.internals.BackoffDemo",
+            "projectName": "",
+            "cwd": "${workspaceFolder}/2026-11-25-java",
+            "args": "input.txt",
+            "encoding": "UTF-8"
+        }
+    ]
+}
