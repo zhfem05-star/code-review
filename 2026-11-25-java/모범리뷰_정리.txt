@@ -1,0 +1,150 @@
+# 코드 리뷰 — 2026-11-25 / Java / 미션 B / 출처: apache/kafka · clients/src/main/java/org/apache/kafka/common/utils/internals/ExponentialBackoff.java
+# (모범 답안 + 오늘 배운 내용 정리 — 다음 미션 B 때 구조 참고용)
+# 줄 번호: ExponentialBackoff.java 첫 줄(package)을 L1로 센 기준
+
+## 1. 목적
+- 무엇을 하나: 재시도·재연결 대기 시간을 계산한다. 실패할수록 지수적으로 늘리고(L47), 랜덤으로 흔들고(L48-49), 상한을 넘지 않게 한다(L51).
+- 왜 필요한가(해결하는 문제):
+  - 지수 증가: 장애 중인 브로커를 짧은 간격으로 계속 두드리면 복구 중인 서버에 부하만 더한다 → 실패가 길어질수록 간격을 벌린다.
+  - jitter: 브로커 재시작 순간 수천 클라이언트가 동시에 실패하면, jitter 없이 모두 같은 시각에 재시도한다(thundering herd) → 시점을 퍼뜨린다.
+  - 상한: 무한히 늘면 서버가 복구된 뒤에도 너무 오래 기다린다 → 회복 감지를 늦추지 않는다.
+- 맥락: Kafka의 Producer·Consumer·AdminClient·연결 관리(ClusterConnectionStates)가 공통으로 쓰는 유틸리티. 배경 문서는 KIP-580.
+
+## 2. 동작 설명
+
+### F1. [L26-36] 생성자 ExponentialBackoff(initialInterval, multiplier, maxInterval, jitter)
+- 입력: 파라미터 4개. Kafka에서 initialInterval·maxInterval은 사용자 설정(retry.backoff.ms=100, retry.backoff.max.ms=1000 기본값),
+        multiplier(2)·jitter(0.2)는 Kafka 코드에 박힌 상수.
+- 처리:
+  - [L27] initialInterval이 maxInterval보다 크면 maxInterval로 깎는다.
+  - [L30-32] jitter가 0~1 밖이면 IllegalArgumentException. 4개 중 유일하게 검증하는 값.
+  - [L34-35] expMax = log_multiplier(max / initial) → "몇 번째 시도에서 상한에 정확히 닿나"를 미리 계산.
+    - 밑 변환: ln(max/initial) / ln(multiplier). 예) 100·2·1000 → ln10/ln2 ≈ 3.32
+    - (double): 정수 나눗셈으로 소수가 잘리는 것을 막음. Math.max(initial, 1): 0으로 나누기 방지.
+    - max <= initial 이면 0 → "지수 모드 끔" 표시.
+- 출력: 필드 5개가 모두 final인 불변 객체.
+
+### F2. [L42-52] backoff(long attempts)
+- 입력: 지금까지 실패한 횟수(호출하는 쪽이 세서 넘김. 기본형이라 값이 복사돼 들어옴).
+- 처리:
+  - [L43-45] expMax == 0이면 계산 없이 상수 반환.
+  - [L46] exp = min(attempts, expMax) → 지수를 상한 지점(3.32)에서 멈춤 → term이 maxInterval을 절대 넘지 않음.
+  - [L47] term = initial × multiplier^exp
+  - [L48-49] jitter가 사실상 0이면 1.0, 아니면 ThreadLocalRandom으로 [1-jitter, 1+jitter) 랜덤 계수.
+  - [L50-51] long으로 잘라서(소수 버림) maxInterval과 비교해 작은 값 반환.
+- 출력: 대기 시간(ms).
+- 손 계산 예 (100, 2, 1000, 0.2):
+  attempts 0 → 100 × [0.8,1.2) → 80~119
+  attempts 3 → 800 × [0.8,1.2) → 640~959
+  attempts 4+ → term=1000 × [0.8,1.2) = 800~1199 → L51에서 1000으로 깎임 → 800~1000 (avg ≈ 950)
+
+## 3. 설계 의도·트레이드오프
+
+### T1. 상태 없는(stateless) 계산기 — 얻은 것 vs 포기한 것
+- 얻은 것: attempts를 필드로 두지 않고 인자로 받는다(L42). 필드 5개가 전부 final 기본형(L20-24)이라 생성 후 절대 안 바뀐다.
+  → 인스턴스 1개를 여러 대상·여러 스레드가 동기화 없이 공유 가능. L17 "thread-safe"의 근거.
+  → 실제로 ClusterConnectionStates는 계산기 1개로 브로커 전체의 재연결을 처리하고, 실패 횟수만 브로커별(NodeConnectionState.failedAttempts)로 센다.
+- 포기한 것: 호출하는 쪽이 attempts를 직접 세고(++), 성공 시 리셋(=0)해야 한다. 잊으면 이 클래스는 알 수 없다.
+  → 상태를 들고 있는 ExponentialBackoffManager는 attempts가 final도 아니고 동기화도 없다.
+    즉 "계산"은 컴파일러가 안전을 보장하고, "상태 관리"는 쓰는 사람의 규율(한 스레드에서만 쓰기)에 맡긴 구조.
+
+### T2. 상한 근처의 jitter — 살렸지만 반만 살림
+- 얻은 것: L46의 expMax 상한 덕분에 term이 정확히 1000에 멈춤.
+  expMax 없이 L51만 있으면 attempts 4부터 term=1600, 6400 … → 흔들어도 전부 1000으로 깎여 모든 클라이언트가 정확히 1000ms에 재시도(실험으로 확인: min=max=1000).
+- 포기한 것: 그래도 L51이 jitter 위쪽 절반(1000~1199)을 1000으로 깎는다.
+  → 상한 구간 분포가 800~1000, 그중 절반이 정확히 1000에 몰림(avg ≈ 950). 상한에 도달한 클라이언트끼리는 재시도가 여전히 상당 부분 동기화된다.
+- 대안 비교: "상한을 먼저 적용하고 그 아래에서 흔들기"(예: AWS의 full jitter, random(0, cap))는 분산이 크지만 평균 대기가 짧아짐.
+  Kafka는 "상한을 넘지 않는다"는 약속(L14-15 Javadoc)을 우선한 선택.
+
+### T3. ThreadLocalRandom (L49)
+- java.util.Random은 시드 하나를 AtomicLong에 두고 CAS로 갱신 → 여러 스레드가 공유하면 갱신 실패·재시도(경합)로 느려짐. 값이 틀리지는 않음.
+- ThreadLocalRandom은 스레드마다 시드를 따로 둬서 경합이 없음 → 마지막 공유 상태까지 없앤 것.
+
+## 4. 개선점·주의할 점
+
+### I1. [L26-36] 🟡~🟠 multiplier·interval 검증이 없어 이상한 값이 조용히 통과
+- 무엇이 문제인가: jitter만 검사하고(L30-32) multiplier·initialInterval·maxInterval은 검사하지 않는다.
+- 재현 (input.txt에 추가해 실행):
+  100  1 1000 0.2 → expMax=Infinity, 계속 80~119   : 늘지 않는데 정상처럼 보임
+  100  0 1000 0.2 → expMax=-0.0,     계속 100      : -0.0 == 0 이 true라 L43 상수 분기
+  100 -2 1000 0.2 → expMax=NaN,      계속 0        : 아래 추적
+- -2 추적: L35 Math.log(-2)=NaN → expMax=NaN → L43 NaN==0 false → L46 Math.min(3,NaN)=NaN
+          → L47 NaN → L50 (long)NaN = 0 → L51 min(0,1000)=0
+  (파동이 안 나오는 이유: 지수가 NaN이고, 정상이어도 3.32 같은 소수라 pow(음수, 소수)=NaN)
+- 왜 위험한가: 대기 0ms = 실패 즉시 무한 재시도 → 이 클래스가 막으려던 "장애 서버 두드리기"를 오히려 최대로 만든다.
+  예외였다면 클라이언트 시작 시점에 바로 드러나지만, 0은 에러 없이 장애 때만 드러난다. "조용히 틀린 값"이 예외보다 위험한 이유.
+- 심각도 근거: Kafka에서 multiplier는 상수 2로 고정이고, interval은 설정 단계에서 atLeast(0) 검증이 있다.
+  → 사용자 실수로 터질 일은 거의 없음. 다만 내부 개발자가 다른 곳에서 재사용할 때의 함정 → 🟡~🟠.
+- 대안: L30-32와 같은 방식으로 생성자에서 검사.
+  if (multiplier < 2) throw new IllegalArgumentException(...)  (1이면 지수 증가 의미 없음, 의도한다면 >= 1)
+  if (initialInterval < 0 || maxInterval < 0) throw ...
+
+### I2. [L48-49] 🟡 jitter=1.0이면 대기 0ms가 나올 수 있음
+- 재현: 100 2 1000 1.0 → attempts 0의 min=0
+- 1-jitter = 0이라 randomFactor가 0 근처까지 내려감 → 즉시 재시도 가능. 상한(L31)을 1 미만으로 하거나 하한을 두는 것 검토.
+
+### I3. [L54-62, L13] 🟡 사소한 문서·디버깅 문제
+- toString에 maxInterval이 빠져 있어 로그만 보고 설정을 다 알 수 없음.
+- Javadoc 오타: {$code maxInterval} → {@code maxInterval}, "less that" → "less than".
+
+## 5. (보너스) 이 코드를 고친다면 먼저 쓸 테스트
+- 테스트: jitter=0 결정적 수열
+  입력: new ExponentialBackoff(100, 2, 1000, 0.0)
+  기대: backoff(0..6) = 100, 200, 400, 800, 1000, 1000, 1000 (정확히 일치)
+- 테스트: jitter>0 범위 검증 (값이 매번 달라서 정확한 값 대신 범위를 검증)
+  입력: (100, 2, 1000, 0.2), 각 attempts마다 1000번 호출
+  기대: 모든 값이 [floor(0.8 × term), min(1.2 × term, 1000)] 안, 1000 초과 없음
+- 테스트: 잘못된 입력 거부 (I1 수정 후)
+  입력: multiplier = 0, -2 / 기대: IllegalArgumentException
+
+## 6. 질문 (오늘 대화에서 나온 것과 답)
+- final 필드는 왜 필요? → 객체는 힙에 1개, 여러 곳이 주소로 공유. final은 "다시 대입 금지"를 컴파일러가 보장.
+  "주의만 하면 된다"는 사람이 늘수록 무너짐 + 읽는 사람이 바로 불변임을 앎 + 다른 스레드에 완성된 값이 보이는 것까지 보장. 비용 0.
+- 계산기는 왜 1개? → new를 1번만 하기 때문. 브로커마다 다른 건 실패 횟수(기록 카드)뿐.
+- 생성자 인자는 어디 저장? → 생성자 실행 중에만 호출한 스레드의 스택 → L27-35에서 힙 객체의 필드로 옮겨 적음 → 스택은 사라짐.
+
+
+==================================================================
+# 부록 A. 오늘 배운 Java 개념 노트
+==================================================================
+
+[메모리 3구역]
+- 스택: 스레드마다 1개. 매개변수·지역변수·객체 주소. 메서드가 끝나면 사라짐. (L46-50의 exp, term 등)
+- 힙: 프로그램 전체 공유. new로 만든 객체와 그 필드. (L20-24)
+- 클래스(메서드 코드): JVM에 1벌. 모든 객체가 공유. 메서드는 this로 "어느 객체의 필드인지" 앎.
+
+[new]
+- 복사가 아니라 설계도(클래스)를 보고 힙에 새 필드 묶음을 만들고 생성자로 채움.
+- a == b → 같은 객체(주소)인가. 값이 같아도 new를 두 번 하면 false.
+- c = a → 새 객체 없음, 같은 객체를 가리키는 변수가 하나 늘 뿐.
+
+[값 전달]
+- Java는 항상 값을 복사해서 넘긴다. 기본형(long, int, double)은 값 자체, 객체는 주소값이 복사됨.
+- 그래서 backoff(failedAttempts) 안에서 attempts를 바꿔도 바깥은 그대로 → 호출하는 쪽이 ++ 해야 함.
+
+[import]
+- 컴파일 때만 쓰는 이름 줄임말. 실행 시 아무것도 가져오거나 복사하지 않음.
+
+[final]
+- 참조(변수)의 재대입만 막음. final List는 add 가능 → 기본형인지 객체 참조인지 꼭 확인.
+- 필드가 전부 final 기본형 = 완전 불변 = 동기화 없이 공유 가능.
+
+[double의 특수값]
+- NaN: 정의 안 되는 계산 결과(log(음수), 0/0). 섞이면 전부 NaN, 비교하면 항상 false(NaN == NaN도 false).
+- Math.min(x, NaN) = NaN. (long)NaN = 0. → 에러 없이 0이 되는 함정.
+- 양수/0 = Infinity, 양수/(-Infinity) = -0.0, 그리고 -0.0 == 0 은 true.
+
+[기타 문법]
+- 조건 ? A : B  = Python의 A if 조건 else B
+- log_b(x) = Math.log(x) / Math.log(b)  (Java엔 밑 지정 로그가 없음)
+
+
+==================================================================
+# 부록 B. "이해는 되는데 문제가 안 보일 때" 리뷰 질문 4개
+==================================================================
+1. 극단값: 각 파라미터에 0, 1, 음수, 아주 큰 값을 넣으면? → 개선점 (오늘 I1, I2)
+2. 이 줄을 지우면?: Math.min, if, 형변환은 누군가 무언가를 막으려고 넣은 것. 무엇을 막나? → 설계 의도 (오늘 L46의 expMax)
+3. 무엇을 포기했나: 얻은 것 옆에는 늘 대가가 있다. → 트레이드오프 (오늘 T1, T2)
+4. 주석 vs 코드: Javadoc의 약속을 코드가 지키나? → (오늘 L17 thread-safe → final + ThreadLocalRandom으로 확인)
++ 실행해서 재현한 결과는 가장 강한 근거. input.txt를 적극적으로 바꿔 보기.
++ 심각도는 "누가, 얼마나 쉽게 그 값을 넣을 수 있나"까지 따져서 정하기.

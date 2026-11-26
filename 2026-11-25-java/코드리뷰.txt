@@ -1,0 +1,34 @@
+# 코드 리뷰 — 2026-11-25 / Java / 미션 B / 출처: apache/kafka · clients/src/main/java/org/apache/kafka/common/utils/internals/ExponentialBackoff.java
+
+## 1. 목적
+- 이 코드는 왜 존재하고, 무엇을 해결하나:
+재시도 시간을 지수적으로 늘리지만 매번 같은 시간을 기다리지 않고, 
+재시도 대기시간이 최대 시간을 넘지 않게 설계한 코드
+무엇을 해결하는지는 모르겠음
+
+## 2. 동작 설명 (2개 이상)
+입력으로 인자를 받으면 그 인자를 토대로 재시도 대기시간을 계산
+long initialInterval: 인터벌, 즉 재시도 간격
+int multiplier: 제곱할 지수 밑
+long maxInterval: 넘지 말아야할 인터벌 간격
+double jitter: 랜덤한 double 자료의 구간을 정하기 위한 인자
+랜덤 요소 * 지수계산 = backoff value하고 maxInterval 중 하나를 반환함
+
+### F1. [L42-52] public long backoff(long attempts)
+- 입력: 시도 횟수
+- 처리: 시도 횟수와 exeMax를 비교하여 작은 쪽을 고르고 지수 대기시간 출력
+        만약 backoffValue가 더 높으면 maxInterval 출력
+- 출력: L51 return Math.min(backoffValue, maxInterval);
+
+
+### F2. [L26-36] public ExponentialBackoff(long initialInterval, int multiplier, long maxInterval, double jitter)
+- 입력: long initialInterval, int multiplier, long maxInterval, double jitter
+- 처리: init 세팅. 입력받은 인자를 인스턴스 내부 변수로 할당하는 과정
+- 출력: void()
+
+## 3. 설계 의도·트레이드오프
+### Q1 
+- backoff 기능을 따로 정의해두고 이걸 가져다 쓰는 스크립트를 따로 만든 설계
+- 새 객체 하나만으로 다른 backoff가 필요한 스레드들의 상태를 관리할 수 있음
+- 단 이를 호출하는 스크립트에서 attempts를 직접 세고, 올리고, 리셋해야 함
+
