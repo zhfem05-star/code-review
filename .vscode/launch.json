@@ -10,6 +10,25 @@
             "cwd": "${workspaceFolder}/2026-11-25-java",
             "args": "input.txt",
             "encoding": "UTF-8"
+        },
+        {
+            "type": "cppdbg",
+            "name": "C++: 활성 파일 디버그 (input.txt)",
+            "request": "launch",
+            "program": "${fileDirname}\\${fileBasenameNoExtension}.exe",
+            "args": ["input.txt"],
+            "cwd": "${fileDirname}",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:\\msys64\\ucrt64\\bin\\gdb.exe",
+            "environment": [
+                { "name": "PATH", "value": "C:\\msys64\\ucrt64\\bin;${env:PATH}" }
+            ],
+            "setupCommands": [
+                { "description": "pretty printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+            ],
+            "preLaunchTask": "C/C++: g++ 활성 파일 빌드"
         }
     ]
 }

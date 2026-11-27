@@ -26,7 +26,7 @@ def create(lang: str, class_name: str = "Main"):
         return
 
     folder.mkdir()
-    for name in ["input.txt", "코드리뷰.txt", *FILES[lang](class_name)]:
+    for name in ["input.txt", "코드리뷰.md", *FILES[lang](class_name)]:
         (folder / name).write_text("", encoding="utf-8")
 
     print(f"생성 완료: {folder}")
