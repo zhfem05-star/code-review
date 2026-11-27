@@ -1,0 +1,10 @@
+# 형식: 시나리오이름 | backoff_factor | backoff_jitter | 이력(E=오류, R=리다이렉트, 오래된 것 -> 최근 순) | Retry-After 헤더(없으면 -)
+s1 | 0.5 | 0 | E | -
+s2 | 0.5 | 0 | E E | -
+s3 | 0.5 | 0 | E E E E E | -
+s4 | 0.5 | 0 | E E E R E | -
+s5 | 0.5 | 0 | E E E | 3
+s6 | 0.5 | 0 | E E E | 0
+s7 | 0.5 | 0 | E E E | Wed, 21 Oct 2015 07:28:00 GMT
+s8 | 100 | 0 | E E E E | -
+s9 | 0.5 | 1.0 | E E E | -
